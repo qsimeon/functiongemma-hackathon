@@ -24,7 +24,7 @@
 - Sept 7: Run `cactus auth` and enter your token when prompted.
 - Step 8: `pip install google-genai`
 - Step 9: Obtain Gemini API key from [Google AI Studio](https://aistudio.google.com/api-keys)
-- Step 10: `export GEMINI_API_KEY="AIzaSyABCdne1epI5q6QzA2maS2IEywiNwqFlPk"`
+- Step 10: `export GEMINI_API_KEY="your-key"`
 - Step 11: Join the [Reddit channel](https://www.reddit.com/r/cactuscompute/), ask any technical questions there.
 - Step 12: read and run `python main.py`, you will modify `generate_hybrid` without breaking the interface.
 - Step 13: read and run `python benchmark.py` to understand how objective scoring works.
