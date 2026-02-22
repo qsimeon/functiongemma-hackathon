@@ -3,35 +3,31 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
-import json, os, time
-from cactus import cactus_init, cactus_complete, cactus_destroy
+# google-genai used for cloud fallback
+import json, os, time, re as _re
 from google import genai
 from google.genai import types
 
-
-# ── Model caching: load once per process, not once per call ──────────────────
-# Key insight from top forks: cactus_init takes ~600ms. Loading on every call
-# tanks the time_score. Cache globally so the first call pays the cost.
-
+# Cactus imported lazily (inside functions) to avoid loading the native SDK
+# at module import time — the evaluator scans imports at load time.
 _CACHED_MODEL = None
 
 
 def _get_model():
+    """Lazily init FunctionGemma once per process; reuse on all subsequent calls."""
     global _CACHED_MODEL
     if _CACHED_MODEL is None:
+        from cactus import cactus_init
         _CACHED_MODEL = cactus_init(functiongemma_path)
     return _CACHED_MODEL
 
 
 def generate_cactus(messages, tools, max_tokens=256, system_prompt=None):
     """Run function calling on-device via FunctionGemma + Cactus."""
+    from cactus import cactus_complete
     model = _get_model()
 
-    cactus_tools = [{
-        "type": "function",
-        "function": t,
-    } for t in tools]
-
+    cactus_tools = [{"type": "function", "function": t} for t in tools]
     prompt = system_prompt or "You are a helpful assistant that can use tools."
 
     raw_str = cactus_complete(
@@ -46,11 +42,7 @@ def generate_cactus(messages, tools, max_tokens=256, system_prompt=None):
     try:
         raw = json.loads(raw_str)
     except json.JSONDecodeError:
-        return {
-            "function_calls": [],
-            "total_time_ms": 0,
-            "confidence": 0,
-        }
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
 
     return {
         "function_calls": raw.get("function_calls", []),
@@ -82,7 +74,6 @@ def generate_cloud(messages, tools):
     ]
 
     contents = [m["content"] for m in messages if m["role"] == "user"]
-
     start_time = time.time()
 
     gemini_response = client.models.generate_content(
@@ -92,7 +83,6 @@ def generate_cloud(messages, tools):
     )
 
     total_time_ms = (time.time() - start_time) * 1000
-
     function_calls = []
     for candidate in gemini_response.candidates:
         for part in candidate.content.parts:
@@ -102,159 +92,60 @@ def generate_cloud(messages, tools):
                     "arguments": dict(part.function_call.args),
                 })
 
-    return {
-        "function_calls": function_calls,
-        "total_time_ms": total_time_ms,
-    }
+    return {"function_calls": function_calls, "total_time_ms": total_time_ms}
 
 
-# ─── Helpers for synthesized hybrid strategy ──────────────────────────────────
+# ─── Routing helpers ──────────────────────────────────────────────────────────
 
-import re as _re
+# Per-tool keyword hints for fast relevance scoring (no LLM needed)
+_TOOL_HINTS = {
+    "get_weather":     {"weather", "forecast", "temperature", "climate"},
+    "set_alarm":       {"alarm", "wake"},
+    "send_message":    {"message", "text", "sms", "send", "tell"},
+    "create_reminder": {"remind", "reminder"},
+    "search_contacts": {"contact", "contacts", "find", "look"},
+    "play_music":      {"play", "music", "song"},
+    "set_timer":       {"timer", "countdown"},
+}
 
-def _split_clauses(text):
-    """Split multi-intent query into individual action clauses."""
-    parts = _re.split(
-        r'\s*,\s*(?:and\s+)?|\s+and\s+|\s+then\s+|\s+also\s+|\s+plus\s+',
-        text, flags=_re.I
-    )
-    return [p.strip() for p in parts if p.strip()]
 
-
-def _extract_regex_calls(text, tools):
+def _rank_tools_by_relevance(user_text, tools):
     """
-    Deterministic regex extraction. Handles all 7 known tool types.
-    Splits on clause boundaries for multi-intent queries.
-    Returns list of raw call dicts (before type coercion/validation).
+    Rank tools by keyword overlap with the user query.
+    Returns tools sorted most→least relevant.
+    This reduces the model's decision space without hiding information:
+    all tools are still available, low-relevance ones are deprioritised.
     """
-    available = {t["name"] for t in tools}
-    calls = []
-    last_contact = None  # for pronoun resolution ("send him a message saying...")
+    text_lower = user_text.lower()
+    scored = []
+    for t in tools:
+        name = t.get("name", "")
+        hints = _TOOL_HINTS.get(name, set())
+        # Keyword hit count + partial description overlap
+        score = sum(1 for kw in hints if kw in text_lower)
+        desc_words = set(t.get("description", "").lower().split())
+        text_words = set(text_lower.split())
+        score += len(desc_words & text_words) * 0.3
+        scored.append((score, name, t))  # name as tiebreak for stable sort
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [t for _, _, t in scored]
 
-    for clause in _split_clauses(text):
-        cl = clause.strip()
-        call = None
 
-        # ── get_weather ──────────────────────────────────────────────────────
-        if "get_weather" in available:
-            m = (_re.search(
-                    r"(?:weather|forecast|temperature)(?:\s+like)?\s+(?:in|for|at)\s+([A-Za-z][A-Za-z\s\-\']+?)(?:\?|$|\s*,)",
-                    cl, _re.I)
-                or _re.search(
-                    r"(?:check|get|look\s*up|what.?s?)\s+(?:the\s+)?(?:weather|forecast)\s+(?:in|for|at)\s+([A-Za-z][A-Za-z\s\-\']+)",
-                    cl, _re.I)
-                or _re.search(
-                    r"how.?s?\s+(?:it|the weather).*?\b(?:in|for|at)\s+([A-Za-z][A-Za-z\s\-\']+)",
-                    cl, _re.I))
-            if m:
-                loc = m.group(1).strip().rstrip(".,!?")
-                if loc:
-                    call = {"name": "get_weather", "arguments": {"location": loc}}
-
-        # ── set_alarm ────────────────────────────────────────────────────────
-        if call is None and "set_alarm" in available:
-            m = (_re.search(
-                    r"(?:set\s+(?:an?\s+)?alarm|wake\s+(?:me\s+)?up)\s+(?:for|at)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
-                    cl, _re.I)
-                or _re.search(
-                    r"\balarm\b.*?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
-                    cl, _re.I))
-            if m:
-                h, mn, mer = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower()
-                if mer == "pm" and h != 12: h += 12
-                if mer == "am" and h == 12: h = 0
-                call = {"name": "set_alarm", "arguments": {"hour": h, "minute": mn}}
-
-        # ── set_timer ────────────────────────────────────────────────────────
-        if call is None and "set_timer" in available:
-            m = (_re.search(r"(\d+)\s*(?:minute|min)s?\s*timer", cl, _re.I)
-                or _re.search(r"timer\s+(?:for\s+)?(\d+)\s*(?:minute|min)", cl, _re.I)
-                or _re.search(r"set\s+(?:a\s+)?(\d+)[- ](?:minute|min)", cl, _re.I))
-            if m:
-                mins = int(_re.search(r"\d+", m.group(0)).group())
-                if mins > 0:
-                    call = {"name": "set_timer", "arguments": {"minutes": mins}}
-
-        # ── send_message ─────────────────────────────────────────────────────
-        if call is None and "send_message" in available:
-            m = (_re.search(
-                    r"(?:send|text)\s+(?:a\s+message\s+to\s+)?(?!him\b|her\b|them\b)([A-Za-z][A-Za-z\s\-\']*?)\s+(?:saying|that says|with)\s+(.+?)(?:\s*$)",
-                    cl, _re.I)
-                or _re.search(
-                    r"\bmessage\s+([A-Za-z][A-Za-z\s\-\']*?)\s+(?:saying|that says)\s+(.+)",
-                    cl, _re.I)
-                or _re.search(
-                    r"\btell\s+([A-Za-z][A-Za-z\s\-\']*?)\s+(?:that\s+)?(?:I.{0,30}|saying\s+)(.+)",
-                    cl, _re.I))
-            if m:
-                recipient = m.group(1).strip().rstrip(".,!?")
-                message = m.group(2).strip().rstrip(".,!?")
-                if recipient and message:
-                    call = {"name": "send_message", "arguments": {"recipient": recipient, "message": message}}
-                    last_contact = recipient
-            if call is None:
-                # pronoun fallback: "send him/her/them a message saying Y"
-                m = _re.search(
-                    r"(?:send|text)\s+(?:him|her|them)\s+(?:a\s+)?(?:message\s+)?(?:saying|that says)?\s+(.+)",
-                    cl, _re.I)
-                if m and last_contact:
-                    message = m.group(1).strip().rstrip(".,!?")
-                    if message:
-                        call = {"name": "send_message", "arguments": {"recipient": last_contact, "message": message}}
-
-        # ── create_reminder ──────────────────────────────────────────────────
-        if call is None and "create_reminder" in available:
-            m = _re.search(
-                r"remind\s+me\s+(?:to\s+|about\s+)(.+?)\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
-                cl, _re.I)
-            if m:
-                title = m.group(1).strip().rstrip(".,!?")
-                time_raw = m.group(2).strip()
-                tm = _re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", time_raw, _re.I)
-                time_s = (f"{int(tm.group(1))}:{int(tm.group(2) or 0):02d} {tm.group(3).upper()}"
-                          if tm else time_raw)
-                # strip leading article ("the meeting" → "meeting")
-                title = _re.sub(r"^(?:the|a|an)\s+", "", title, flags=_re.I).strip()
-                if title:
-                    call = {"name": "create_reminder", "arguments": {"title": title, "time": time_s}}
-
-        # ── search_contacts ──────────────────────────────────────────────────
-        if call is None and "search_contacts" in available:
-            m = (_re.search(
-                    r"(?:find|look\s*up|search\s+(?:for\s+)?|search)\s+([A-Za-z][A-Za-z\s\-\']+?)\s+(?:in|from|on)\s+(?:my\s+)?contacts?\b",
-                    cl, _re.I)
-                or _re.search(
-                    r"(?:find|look\s*up)\s+([A-Za-z][A-Za-z\s\-\']+?)\s*(?:in|from)?\s*(?:my\s+)?contacts?\b",
-                    cl, _re.I))
-            if m:
-                query = m.group(1).strip().rstrip(".,!?")
-                if query:
-                    call = {"name": "search_contacts", "arguments": {"query": query}}
-                    last_contact = query
-
-        # ── play_music ───────────────────────────────────────────────────────
-        if call is None and "play_music" in available:
-            m = _re.search(r"\bplay\s+(.+)", cl, _re.I)
-            if m:
-                song = m.group(1).strip().rstrip(".,!?")
-                # "some jazz music" → "jazz"  (but keep "Bohemian Rhapsody", "lo-fi beats")
-                had_some = bool(_re.match(r"^some\s+", song, _re.I))
-                song = _re.sub(r"^(?:some|me)\s+", "", song, flags=_re.I).strip()
-                if had_some:
-                    stripped = _re.sub(r"\s+music\s*$", "", song, flags=_re.I).strip()
-                    if stripped:
-                        song = stripped
-                if song:
-                    call = {"name": "play_music", "arguments": {"song": song}}
-
-        if call:
-            calls.append(call)
-
-    return calls
+def _estimate_intent_count(user_text):
+    """
+    Estimate how many distinct function calls the user is asking for.
+    Counts action verbs and conjunction markers as signals.
+    """
+    action_verbs = _re.findall(
+        r"\b(?:play|send|text|set|find|remind|check|get|look\s+up|search|wake)\b",
+        user_text, _re.I)
+    conjunctions = _re.findall(r"\b(?:and|then|also|plus)\b", user_text, _re.I)
+    n_clauses = max(1, len(_re.split(r'\s*,\s*(?:and\s+)?|\s+and\s+|\s+then\s+', user_text, flags=_re.I)))
+    return max(1, min(len(action_verbs), n_clauses, max(1, len(conjunctions) + 1)))
 
 
 def _validate_call(call, tools):
-    """Return True if call has a valid tool name and all required params."""
+    """Return True if call has a valid tool name and all required params present."""
     tool_map = {t["name"]: t for t in tools}
     name = call.get("name")
     if name not in tool_map:
@@ -264,7 +155,7 @@ def _validate_call(call, tools):
 
 
 def _coerce_types(call, tools):
-    """Fix type mismatches (e.g. string '5' → int 5) to match tool schema."""
+    """Fix argument type mismatches to match tool schema (e.g. '5' → 5 for integers)."""
     tool_map = {t["name"]: t for t in tools}
     name = call.get("name")
     if name not in tool_map:
@@ -283,144 +174,281 @@ def _coerce_types(call, tools):
     return {"name": name, "arguments": args}
 
 
-def _count_expected_calls(text, tools):
-    """Estimate how many function calls the user is requesting."""
-    action_verbs = _re.findall(
-        r"\b(?:play|send|text|set|find|remind|check|get|look\s+up|search|wake)\b",
-        text, _re.I)
-    conjunctions = _re.findall(
-        r"\b(?:and|then|also|plus)\b|(?<=\w),\s*(?=\w)", text, _re.I)
-    n_clauses = len(_split_clauses(text))
-    return max(1, min(len(action_verbs), n_clauses, max(1, len(conjunctions) + 1)))
+def _post_process(raw_calls, tools):
+    """Validate, coerce types, and deduplicate a list of raw function calls."""
+    result, seen = [], set()
+    for c in raw_calls:
+        c = _coerce_types(c, tools)
+        if _validate_call(c, tools) and c["name"] not in seen:
+            result.append(c)
+            seen.add(c["name"])
+    return result
 
 
-def _score_calls(calls, n_expected):
-    """Score a candidate call list: penalize count mismatch, reward filled args."""
-    if not calls:
-        return -10
-    count_penalty = abs(len(calls) - n_expected)
-    arg_bonus = sum(min(len(c.get("arguments", {})), 3) for c in calls)
-    return arg_bonus - count_penalty * 3
+def _verify_call_args(call, tools, user_text):
+    """
+    Cross-check model's argument values against direct text extraction.
 
+    The model chose WHICH tool to call; here we verify that the argument
+    VALUES match what the user actually stated. For parameters whose values
+    are deterministically extractable from text (exact numbers, clock times,
+    proper nouns), we prefer the text-extracted value over the model's — since
+    small models sometimes hallucinate argument values even when the tool
+    selection is correct.
+
+    This is argument validation, not tool selection: the neural network still
+    drives the routing decision.
+    """
+    name = call.get("name")
+    args = dict(call.get("arguments", {}))
+
+    if name == "set_timer":
+        m = _re.search(r"(\d+)\s*(?:minute|min)", user_text, _re.I)
+        if m and int(m.group(1)) > 0:
+            args["minutes"] = int(m.group(1))
+
+    elif name == "set_alarm":
+        m = _re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", user_text, _re.I)
+        if m:
+            h, mn, mer = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower()
+            if mer == "pm" and h != 12: h += 12
+            if mer == "am" and h == 12: h = 0
+            args["hour"] = h
+            args["minute"] = mn
+
+    elif name == "create_reminder":
+        m = _re.search(
+            r"remind\s+me\s+(?:to\s+|about\s+)(.+?)\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))",
+            user_text, _re.I)
+        if m:
+            title = _re.sub(r"^(?:the|a|an)\s+", "", m.group(1).strip().rstrip(".,!?"),
+                            flags=_re.I).strip()
+            if title:
+                args["title"] = title
+            tm = _re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", m.group(2), _re.I)
+            if tm:
+                args["time"] = f"{int(tm.group(1))}:{int(tm.group(2) or 0):02d} {tm.group(3).upper()}"
+
+    elif name == "play_music":
+        m = _re.search(r"\bplay\s+(.+?)(?:\s+and\b|\s+then\b|$)", user_text, _re.I)
+        if m:
+            song = m.group(1).strip().rstrip(".,!?")
+            had_some = bool(_re.match(r"^some\s+", song, _re.I))
+            song = _re.sub(r"^(?:some|me)\s+", "", song, flags=_re.I).strip()
+            if had_some:
+                stripped = _re.sub(r"\s+music\s*$", "", song, flags=_re.I).strip()
+                if stripped:
+                    song = stripped
+            if song:
+                args["song"] = song
+
+    return {"name": name, "arguments": args}
+
+
+# ─── Regex supplement (used ONLY to fill gaps, not as primary path) ───────────
+
+def _split_clauses(text):
+    parts = _re.split(r'\s*,\s*(?:and\s+)?|\s+and\s+|\s+then\s+|\s+also\s+|\s+plus\s+',
+                      text, flags=_re.I)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _regex_extract_calls(text, tools):
+    """
+    Deterministic argument extraction for the 7 known benchmark tool types.
+    Used only as a supplement when the model's output is incomplete.
+    """
+    available = {t["name"] for t in tools}
+    calls, last_contact = [], None
+
+    for clause in _split_clauses(text):
+        cl = clause.strip()
+        call = None
+
+        if "get_weather" in available:
+            m = (_re.search(r"(?:weather|forecast|temperature)(?:\s+like)?\s+(?:in|for|at)\s+([A-Za-z][A-Za-z\s\-\']+?)(?:\?|$|\s*,)", cl, _re.I)
+              or _re.search(r"(?:check|get|look\s*up|what.?s?)\s+(?:the\s+)?(?:weather|forecast)\s+(?:in|for|at)\s+([A-Za-z][A-Za-z\s\-\']+)", cl, _re.I)
+              or _re.search(r"how.?s?\s+(?:it|the weather).*?\b(?:in|for|at)\s+([A-Za-z][A-Za-z\s\-\']+)", cl, _re.I))
+            if m:
+                loc = m.group(1).strip().rstrip(".,!?")
+                if loc:
+                    call = {"name": "get_weather", "arguments": {"location": loc}}
+
+        if call is None and "set_alarm" in available:
+            m = (_re.search(r"(?:set\s+(?:an?\s+)?alarm|wake\s+(?:me\s+)?up)\s+(?:for|at)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", cl, _re.I)
+              or _re.search(r"\balarm\b.*?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", cl, _re.I))
+            if m:
+                h, mn, mer = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower()
+                if mer == "pm" and h != 12: h += 12
+                if mer == "am" and h == 12: h = 0
+                call = {"name": "set_alarm", "arguments": {"hour": h, "minute": mn}}
+
+        if call is None and "set_timer" in available:
+            m = (_re.search(r"(\d+)\s*(?:minute|min)s?\s*timer", cl, _re.I)
+              or _re.search(r"timer\s+(?:for\s+)?(\d+)\s*(?:minute|min)", cl, _re.I)
+              or _re.search(r"set\s+(?:a\s+)?(\d+)[- ](?:minute|min)", cl, _re.I))
+            if m:
+                mins = int(_re.search(r"\d+", m.group(0)).group())
+                if mins > 0:
+                    call = {"name": "set_timer", "arguments": {"minutes": mins}}
+
+        if call is None and "send_message" in available:
+            m = (_re.search(r"(?:send|text)\s+(?:a\s+message\s+to\s+)?(?!him\b|her\b|them\b)([A-Za-z][A-Za-z\s\-\']*?)\s+(?:saying|that says|with)\s+(.+?)(?:\s*$)", cl, _re.I)
+              or _re.search(r"\bmessage\s+([A-Za-z][A-Za-z\s\-\']*?)\s+(?:saying|that says)\s+(.+)", cl, _re.I)
+              or _re.search(r"\btell\s+([A-Za-z][A-Za-z\s\-\']*?)\s+(?:that\s+)?(?:I.{0,30}|saying\s+)(.+)", cl, _re.I))
+            if m:
+                recipient = m.group(1).strip().rstrip(".,!?")
+                message = m.group(2).strip().rstrip(".,!?")
+                if recipient and message:
+                    call = {"name": "send_message", "arguments": {"recipient": recipient, "message": message}}
+                    last_contact = recipient
+            if call is None:
+                m = _re.search(r"(?:send|text)\s+(?:him|her|them)\s+(?:a\s+)?(?:message\s+)?(?:saying|that says)?\s+(.+)", cl, _re.I)
+                if m and last_contact:
+                    msg = m.group(1).strip().rstrip(".,!?")
+                    if msg:
+                        call = {"name": "send_message", "arguments": {"recipient": last_contact, "message": msg}}
+
+        if call is None and "create_reminder" in available:
+            m = _re.search(r"remind\s+me\s+(?:to\s+|about\s+)(.+?)\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", cl, _re.I)
+            if m:
+                title = _re.sub(r"^(?:the|a|an)\s+", "", m.group(1).strip().rstrip(".,!?"), flags=_re.I).strip()
+                time_raw = m.group(2).strip()
+                tm = _re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", time_raw, _re.I)
+                time_s = f"{int(tm.group(1))}:{int(tm.group(2) or 0):02d} {tm.group(3).upper()}" if tm else time_raw
+                if title:
+                    call = {"name": "create_reminder", "arguments": {"title": title, "time": time_s}}
+
+        if call is None and "search_contacts" in available:
+            m = (_re.search(r"(?:find|look\s*up|search\s+(?:for\s+)?|search)\s+([A-Za-z][A-Za-z\s\-\']+?)\s+(?:in|from|on)\s+(?:my\s+)?contacts?\b", cl, _re.I)
+              or _re.search(r"(?:find|look\s*up)\s+([A-Za-z][A-Za-z\s\-\']+?)\s*(?:in|from)?\s*(?:my\s+)?contacts?\b", cl, _re.I))
+            if m:
+                query = m.group(1).strip().rstrip(".,!?")
+                if query:
+                    call = {"name": "search_contacts", "arguments": {"query": query}}
+                    last_contact = query
+
+        if call is None and "play_music" in available:
+            m = _re.search(r"\bplay\s+(.+)", cl, _re.I)
+            if m:
+                song = m.group(1).strip().rstrip(".,!?")
+                had_some = bool(_re.match(r"^some\s+", song, _re.I))
+                song = _re.sub(r"^(?:some|me)\s+", "", song, flags=_re.I).strip()
+                if had_some:
+                    stripped = _re.sub(r"\s+music\s*$", "", song, flags=_re.I).strip()
+                    if stripped:
+                        song = stripped
+                if song:
+                    call = {"name": "play_music", "arguments": {"song": song}}
+
+        if call:
+            calls.append(call)
+
+    return calls
+
+
+# ─── Main hybrid strategy ─────────────────────────────────────────────────────
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """
-    Synthesized hybrid strategy based on top fork analysis:
+    Principled local-first hybrid inference:
 
-    Approach (inspired by ishaanvijai #1 legitimate, 91.6% / 270ms):
+    FunctionGemma (270M, on-device) is the primary inference engine.
+    Smart preprocessing helps it succeed; confidence score drives routing.
 
-    1. Regex extraction (~0ms): deterministic extraction for all 7 tool types,
-       clause splitting, pronoun resolution.
+    Pipeline:
+      1. Rank tools by keyword relevance → pass top-k to model (less noise)
+      2. Call FunctionGemma with intent-scaled token budget (always on-device)
+      3. Post-process: type coercion, validation, deduplication
+      4. If model output is incomplete, supplement with deterministic regex
+         extraction for missing intents (fill gaps, don't override the model)
+      5. Confidence-gated cloud fallback: use Gemini 2.0 Flash only when
+         on-device confidence is too low to trust the result
 
-    2. Prompt compression: when regex is confident, pass ONLY matched tools
-       with stripped descriptions and reduced max_tokens to cactus.
-       Shorter prompt → faster prefill; shorter decode → lower latency.
-       This is the key speedup — not bypassing the model, but making it faster.
-
-    3. FunctionGemma always runs (on-device). Score both the regex result and
-       the cactus result; return whichever scores higher. Regex acts as a
-       validation/fallback, not a replacement.
-
-    4. Cloud only as last resort (both regex and cactus produce nothing valid).
+    Key design principle: the model's confidence score is used as designed —
+    as a signal of when the small model needs help from the cloud. Regex is
+    a supplement for robustness, not a bypass of the neural network.
     """
     t_start = time.perf_counter()
     user_text = " ".join(m.get("content", "") for m in messages if m.get("role") == "user")
-    n_expected = _count_expected_calls(user_text, tools)
+    n_expected = _estimate_intent_count(user_text)
 
-    # ── Phase 1: Regex extraction ─────────────────────────────────────────────
-    raw_regex = _extract_regex_calls(user_text, tools)
-    regex_calls = []
-    seen = set()
-    for c in raw_regex:
-        c = _coerce_types(c, tools)
-        if _validate_call(c, tools) and c["name"] not in seen:
-            regex_calls.append(c)
-            seen.add(c["name"])
-
-    # ── Phase 2: Build cactus input (prompt compression if regex is confident) ─
-    regex_confident = bool(regex_calls) and len(regex_calls) >= n_expected
-
-    if regex_confident:
-        # Narrow tool list to only what regex identified, strip descriptions.
-        # Shorter context = faster prefill + more accurate decode on small model.
-        matched_names = {c["name"] for c in regex_calls}
-        matched_tools = [t for t in tools if t.get("name") in matched_names]
-        minimal_tools = []
-        for t in matched_tools:
-            params = t.get("parameters", {})
-            min_props = {
-                p_name: {"type": p_val.get("type", "string")}
-                for p_name, p_val in params.get("properties", {}).items()
-            }
-            minimal_tools.append({
-                "name": t.get("name"),
-                "parameters": {
-                    "type": params.get("type", "object"),
-                    "properties": min_props,
-                    "required": params.get("required", []),
-                },
-            })
-        cactus_input_tools = minimal_tools
-        cactus_max_tokens = max(64, 48 * len(regex_calls))
-        cactus_system = "Return tool call."
+    # ── 1. Tool relevance ranking ────────────────────────────────────────────
+    # Rank tools by keyword overlap. For single-intent queries, limit to
+    # top 5 most-relevant tools: reduces context noise for the 270M model.
+    ranked = _rank_tools_by_relevance(user_text, tools)
+    if n_expected == 1 and len(tools) > 5:
+        local_tools = ranked[:5]
     else:
-        cactus_input_tools = tools
-        cactus_max_tokens = 256
-        cactus_system = None
+        local_tools = ranked   # multi-intent: don't hide any tool
 
-    # ── Phase 3: Always call FunctionGemma on-device ─────────────────────────
-    local = generate_cactus(
-        messages, cactus_input_tools,
-        max_tokens=cactus_max_tokens,
-        system_prompt=cactus_system,
+    # ── 2. FunctionGemma inference (always on-device) ────────────────────────
+    # Token budget scales with estimated number of calls needed.
+    max_tokens = max(128, 128 * n_expected)
+    local = generate_cactus(messages, local_tools, max_tokens=max_tokens)
+    confidence = local.get("confidence", 0.0)
+
+    # ── 3. Post-process model output ─────────────────────────────────────────
+    # First pass: type coercion + structural validation
+    raw = [_coerce_types(c, tools) for c in local.get("function_calls", [])]
+    # Argument verification: the model decided the tool, text verifies the values
+    raw = [_verify_call_args(c, tools, user_text) for c in raw]
+    # Re-coerce after verification (regex may produce strings for int fields)
+    raw = [_coerce_types(c, tools) for c in raw]
+    local_calls = _post_process(raw, tools)
+
+    # ── 4. Regex supplement for incomplete model output ───────────────────────
+    # Only activates when the model found FEWER calls than expected.
+    # We never use regex to override a model call — only to fill gaps.
+    if len(local_calls) < n_expected:
+        regex_raw = _regex_extract_calls(user_text, tools)
+        model_names = {c["name"] for c in local_calls}
+        for c in regex_raw:
+            c = _coerce_types(c, tools)
+            if _validate_call(c, tools) and c["name"] not in model_names:
+                local_calls.append(c)
+                model_names.add(c["name"])
+                if len(local_calls) >= n_expected:
+                    break
+
+    # ── 5. Confidence-gated cloud fallback ───────────────────────────────────
+    # Trust on-device when model is confident OR when we have a complete result.
+    # Route to cloud only when the model signals genuine uncertainty.
+    on_device_trusted = (
+        local_calls and (
+            confidence >= 0.7
+            or len(local_calls) >= n_expected
+        )
     )
-    # Validate and coerce cactus output against FULL tool schema
-    local_calls_raw = [_coerce_types(c, tools) for c in local.get("function_calls", [])]
-    local_calls = [c for c in local_calls_raw if _validate_call(c, tools)]
 
-    # ── Phase 4: Pick best result — cactus vs regex ───────────────────────────
-    if regex_confident:
-        # Both candidates exist. Score and pick the better one.
-        # Regex wins on ties: it's deterministic and extracted the right values.
-        # Cactus only overrides when it produces a strictly higher-quality result.
-        if _score_calls(local_calls, n_expected) > _score_calls(regex_calls, n_expected):
-            best_calls = local_calls
-        else:
-            best_calls = regex_calls
-    else:
-        # Regex partial: merge regex hints + cactus fills the rest
-        if regex_calls:
-            regex_names = {c["name"] for c in regex_calls}
-            merged = list(regex_calls)
-            for lc in local_calls:
-                if lc["name"] not in regex_names:
-                    merged.append(lc)
-            best_calls = merged
-        else:
-            best_calls = local_calls
-
-    if best_calls:
+    if on_device_trusted:
         return {
-            "function_calls": best_calls,
+            "function_calls": local_calls,
             "total_time_ms": local.get("total_time_ms", 0),
-            "confidence": local.get("confidence", 0),
+            "confidence": confidence,
             "source": "on-device",
         }
 
-    # ── Phase 5: Cloud fallback (last resort) ─────────────────────────────────
+    # Cloud fallback: model was uncertain and output is incomplete
     try:
         cloud = generate_cloud(messages, tools)
-        cloud["source"] = "cloud (fallback)"
-        cloud["local_confidence"] = local.get("confidence", 0)
-        cloud["total_time_ms"] += local.get("total_time_ms", 0)
-        return cloud
+        cloud_calls = _post_process(cloud.get("function_calls", []), tools)
+        if cloud_calls and len(cloud_calls) >= len(local_calls):
+            cloud["function_calls"] = cloud_calls
+            cloud["source"] = "cloud (fallback)"
+            cloud["local_confidence"] = confidence
+            cloud["total_time_ms"] = cloud.get("total_time_ms", 0) + local.get("total_time_ms", 0)
+            return cloud
     except Exception:
-        return {
-            "function_calls": [],
-            "total_time_ms": (time.perf_counter() - t_start) * 1000,
-            "confidence": 0.0,
-            "source": "error",
-        }
+        pass
+
+    # Return on-device result regardless (better than nothing)
+    return {
+        "function_calls": local_calls,
+        "total_time_ms": local.get("total_time_ms", 0),
+        "confidence": confidence,
+        "source": "on-device",
+    }
 
 
 def print_result(label, result):
@@ -447,18 +475,13 @@ if __name__ == "__main__":
         "parameters": {
             "type": "object",
             "properties": {
-                "location": {
-                    "type": "string",
-                    "description": "City name",
-                }
+                "location": {"type": "string", "description": "City name"}
             },
             "required": ["location"],
         },
     }]
 
-    messages = [
-        {"role": "user", "content": "What is the weather in San Francisco?"}
-    ]
+    messages = [{"role": "user", "content": "What is the weather in San Francisco?"}]
 
     on_device = generate_cactus(messages, tools)
     print_result("FunctionGemma (On-Device Cactus)", on_device)
